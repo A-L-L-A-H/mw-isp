@@ -233,6 +233,8 @@ pub struct RecordAccountingParams<'a> {
 struct AppState {
     db: Database,
     admin_token: String,
+    vouchers: Arc<moonwitness_isp::vouchers::VoucherStore>,
+    audit: Arc<moonwitness_isp::session_audit::AuditLog>,
 }
 
 #[derive(Clone)]
@@ -1171,7 +1173,12 @@ async fn run_acct_server(addr: SocketAddr, db: Database) -> Result<()> {
 }
 
 fn build_http_router(db: Database, admin_token: String) -> Router {
-    let state = AppState { db, admin_token };
+    let state = AppState {
+        db,
+        admin_token,
+        vouchers: Arc::default(),
+        audit: Arc::default(),
+    };
     let protected = Router::new()
         .route("/api/clients", get(list_clients).post(create_client))
         .route("/api/clients/{ip}/rotate-secret", post(rotate_secret))
@@ -1190,6 +1197,13 @@ fn build_http_router(db: Database, admin_token: String) -> Router {
         .route("/api/fttx/isolir/evaluate", post(fttx_isolir_evaluate))
         .route("/api/fttx/acs/inform", post(fttx_acs_inform))
         .route("/metrics", get(get_metrics))
+        .route("/api/isp/mikrotik/generate-rsc", post(isp_generate_rsc))
+        .route("/api/isp/vouchers/batch", post(isp_voucher_batch))
+        .route("/api/isp/vouchers/redeem", post(isp_voucher_redeem))
+        .route("/api/isp/vouchers", get(isp_voucher_list))
+        .route("/api/isp/sessions/live", get(isp_sessions_live))
+        .route("/api/isp/sessions/{id}/disconnect", post(isp_session_disconnect))
+        .route("/api/isp/metrics", get(isp_metrics))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -1266,6 +1280,125 @@ async fn fttx_acs_inform(
                 Json(serde_json::json!({ "error": err.to_string() })),
             )
         })
+}
+
+async fn isp_generate_rsc(
+    Json(req): Json<moonwitness_isp::mikrotik_config::MikrotikConfigRequest>,
+) -> Result<String, (StatusCode, String)> {
+    moonwitness_isp::mikrotik_config::generate_rsc(&req)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))
+}
+
+fn voucher_status(err: &moonwitness_isp::vouchers::VoucherError) -> StatusCode {
+    use moonwitness_isp::vouchers::VoucherError as E;
+    match err {
+        E::NotFound => StatusCode::NOT_FOUND,
+        E::AlreadyRedeemed => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+async fn isp_voucher_batch(
+    State(state): State<AppState>,
+    Json(req): Json<moonwitness_isp::vouchers::BatchRequest>,
+) -> Result<Json<Vec<moonwitness_isp::vouchers::Voucher>>, (StatusCode, String)> {
+    state
+        .vouchers
+        .create_batch(&req)
+        .map(Json)
+        .map_err(|err| (voucher_status(&err), err.to_string()))
+}
+
+#[derive(serde::Deserialize)]
+struct VoucherRedeemRequest {
+    code: String,
+    username: String,
+}
+
+async fn isp_voucher_redeem(
+    State(state): State<AppState>,
+    Json(req): Json<VoucherRedeemRequest>,
+) -> Result<Json<moonwitness_isp::vouchers::Voucher>, (StatusCode, String)> {
+    state
+        .vouchers
+        .redeem(&req.code, &req.username)
+        .map(Json)
+        .map_err(|err| (voucher_status(&err), err.to_string()))
+}
+
+async fn isp_voucher_list(
+    State(state): State<AppState>,
+) -> Json<Vec<moonwitness_isp::vouchers::Voucher>> {
+    Json(state.vouchers.list())
+}
+
+async fn isp_sessions_live(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<RadiusSessionRow>>, StatusCode> {
+    let rows = state
+        .db
+        .list_sessions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows.into_iter().filter(|row| row.status == "active").collect()))
+}
+
+async fn isp_session_disconnect(
+    State(state): State<AppState>,
+    axum::extract::Path(session_row_id): axum::extract::Path<i64>,
+) -> Result<Json<DisconnectResponse>, StatusCode> {
+    let rows = state
+        .db
+        .list_sessions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let row = rows
+        .into_iter()
+        .find(|row| row.id == session_row_id && row.status == "active")
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let audit = state.audit.clone();
+    let request = DisconnectRequest {
+        username: row.username.clone(),
+        nas_ip: row.nas_ip.clone(),
+        acct_session_id: Some(row.session_id.clone()),
+        framed_ip: row.framed_ip.clone(),
+        coa_port: None,
+    };
+    let outcome = disconnect_session(State(state), Json(request)).await;
+    let entry = match &outcome {
+        Ok(Json(resp)) => moonwitness_isp::session_audit::DisconnectAuditEntry {
+            session_row_id,
+            username: row.username,
+            nas_ip: resp.nas_ip.clone(),
+            sent: resp.sent,
+            ack: resp.ack,
+            error: resp.error.clone(),
+        },
+        Err(status) => moonwitness_isp::session_audit::DisconnectAuditEntry {
+            session_row_id,
+            username: row.username,
+            nas_ip: row.nas_ip,
+            sent: false,
+            ack: false,
+            error: Some(status.to_string()),
+        },
+    };
+    audit.record(entry);
+    outcome
+}
+
+async fn isp_metrics(
+    State(state): State<AppState>,
+) -> Result<Json<moonwitness_isp::session_audit::IspMetrics>, StatusCode> {
+    let rows = state
+        .db
+        .list_sessions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let live: Vec<&RadiusSessionRow> = rows.iter().filter(|row| row.status == "active").collect();
+    let input: i64 = live.iter().map(|row| row.acct_input_octets64).sum();
+    let output: i64 = live.iter().map(|row| row.acct_output_octets64).sum();
+    Ok(Json(state.audit.metrics(live.len() as u64, input, output)))
 }
 
 async fn health() -> Json<serde_json::Value> {
