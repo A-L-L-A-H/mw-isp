@@ -6,3 +6,4 @@
 //! (apps/isp/src/main.rs, which carries the only `mod control_contract;` edit).
 
 pub mod control_contract;
+pub mod fttx_suite;

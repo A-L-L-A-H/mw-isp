@@ -1,5 +1,6 @@
-mod radius_protocol;
 mod control_contract;
+mod fttx_suite;
+mod radius_protocol;
 
 use anyhow::Result;
 use axum::{
@@ -1185,6 +1186,9 @@ fn build_http_router(db: Database, admin_token: String) -> Router {
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/disconnect", post(disconnect_session))
         .route("/api/stats", get(get_stats))
+        .route("/api/fttx/trustpositif/check", post(fttx_trustpositif_check))
+        .route("/api/fttx/isolir/evaluate", post(fttx_isolir_evaluate))
+        .route("/api/fttx/acs/inform", post(fttx_acs_inform))
         .route("/metrics", get(get_metrics))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1222,6 +1226,46 @@ async fn require_bearer_auth(
     } else {
         Err(StatusCode::UNAUTHORIZED)
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TrustPositifCheckRequest {
+    domain: String,
+    #[serde(default)]
+    rules: Vec<fttx_suite::TrustPositifRule>,
+}
+
+async fn fttx_trustpositif_check(
+    Json(req): Json<TrustPositifCheckRequest>,
+) -> Json<fttx_suite::TrustPositifDecision> {
+    let matcher = fttx_suite::TrustPositifMatcher::from_rules(&req.rules);
+    Json(matcher.evaluate(&req.domain))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IsolirEvaluateRequest {
+    #[serde(default)]
+    policy: fttx_suite::IsolirPolicy,
+    subscriber: fttx_suite::IsolirSubscriberInput,
+}
+
+async fn fttx_isolir_evaluate(
+    Json(req): Json<IsolirEvaluateRequest>,
+) -> Json<fttx_suite::IsolirEvaluation> {
+    Json(req.policy.evaluate(&req.subscriber))
+}
+
+async fn fttx_acs_inform(
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<fttx_suite::AcsInformDevice>, (StatusCode, Json<serde_json::Value>)> {
+    fttx_suite::parse_acs_inform_value(&payload)
+        .map(Json)
+        .map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+        })
 }
 
 async fn health() -> Json<serde_json::Value> {
