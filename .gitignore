@@ -1,0 +1,17 @@
+# Cargo
+/target/
+**/*.rs.bk
+
+# Config
+config.toml
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
