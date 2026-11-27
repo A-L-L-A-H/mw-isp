@@ -47,9 +47,9 @@ pub enum ConfigError {
 fn safe_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | ':' | '=' | '+' | '*'))
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | ':' | '=' | '+' | '*')
+        })
 }
 
 pub fn generate_rsc(req: &MikrotikConfigRequest) -> Result<String, ConfigError> {
@@ -83,7 +83,9 @@ pub fn generate_rsc(req: &MikrotikConfigRequest) -> Result<String, ConfigError> 
         RouterOsVersion::V7 => "v7",
     };
     let mut out = String::new();
-    out.push_str(&format!("# MoonWitness ISP RouterOS {version} provisioning\n"));
+    out.push_str(&format!(
+        "# MoonWitness ISP RouterOS {version} provisioning\n"
+    ));
     out.push_str(&format!(
         "/radius add service=ppp,hotspot address={} secret=\"{}\" authentication-port=1812 accounting-port=1813 timeout=3s comment=moonwitness\n",
         req.radius_server, req.shared_secret
@@ -96,9 +98,13 @@ pub fn generate_rsc(req: &MikrotikConfigRequest) -> Result<String, ConfigError> 
         "/ppp profile add name={profile} local-address={local} remote-address={pool} use-encryption=yes\n"
     ));
     out.push_str("/ppp aaa set use-radius=yes accounting=yes interim-update=5m\n");
-    out.push_str("/ip hotspot profile set [find default=yes] use-radius=yes radius-accounting=yes\n");
+    out.push_str(
+        "/ip hotspot profile set [find default=yes] use-radius=yes radius-accounting=yes\n",
+    );
     for host in &req.walled_garden {
-        out.push_str(&format!("/ip hotspot walled-garden add dst-host={host} action=allow\n"));
+        out.push_str(&format!(
+            "/ip hotspot walled-garden add dst-host={host} action=allow\n"
+        ));
     }
     if let Some(peer) = &req.vpn_peer {
         match peer.kind.as_str() {
@@ -106,7 +112,9 @@ pub fn generate_rsc(req: &MikrotikConfigRequest) -> Result<String, ConfigError> 
                 let key = peer.public_key.as_deref().unwrap_or_default();
                 let allowed = peer.allowed_address.as_deref().unwrap_or("10.200.0.0/24");
                 if !safe_token(key) || !safe_token(allowed) {
-                    return Err(ConfigError::InvalidPeer("wireguard key/allowed address".into()));
+                    return Err(ConfigError::InvalidPeer(
+                        "wireguard key/allowed address".into(),
+                    ));
                 }
                 out.push_str("/interface wireguard add name=wg-mw listen-port=13231\n");
                 let endpoint = match &peer.endpoint {
@@ -125,7 +133,9 @@ pub fn generate_rsc(req: &MikrotikConfigRequest) -> Result<String, ConfigError> 
             }
             "tailscale" => {
                 if req.routeros_version == RouterOsVersion::V6 {
-                    return Err(ConfigError::InvalidPeer("tailscale requires RouterOS v7 container".into()));
+                    return Err(ConfigError::InvalidPeer(
+                        "tailscale requires RouterOS v7 container".into(),
+                    ));
                 }
                 out.push_str("/container add remote-image=tailscale/tailscale:latest interface=veth-ts root-dir=disk1/tailscale start-on-boot=yes\n");
             }

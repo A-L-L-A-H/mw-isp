@@ -1,7 +1,7 @@
 //! Versioned Go-to-Rust ISP runtime control contract.
 //!
 //! Defines serde request/response envelopes used between the Go control plane
-//! (apps/control-plane) and Rust ISP server runtimes (apps/isp), plus the
+//! (`mw-cp`) and the standalone Rust ISP server runtime (`mw-isp`), plus the
 //! validation rules that turn a raw envelope into a typed outcome.
 //!
 //! Architecture references:
@@ -132,11 +132,9 @@ impl fmt::Display for RejectionReason {
             RejectionReason::UnsupportedVersion(v) => {
                 write!(f, "unsupported contract schema version {}", v)
             }
-            RejectionReason::StaleGeneration { seen, current } => write!(
-                f,
-                "stale config generation {} (current {})",
-                seen, current
-            ),
+            RejectionReason::StaleGeneration { seen, current } => {
+                write!(f, "stale config generation {} (current {})", seen, current)
+            }
             RejectionReason::DuplicateOperation { operation_id } => {
                 write!(f, "duplicate operation id {}", operation_id)
             }

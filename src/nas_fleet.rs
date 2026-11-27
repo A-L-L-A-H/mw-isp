@@ -102,7 +102,10 @@ impl NasFleetStore {
         Ok(rows.into_iter().map(NasFleetClientSummary::from).collect())
     }
 
-    pub async fn upsert_client(&self, req: &UpsertNasRequest) -> Result<NasFleetClientSummary, NasFleetError> {
+    pub async fn upsert_client(
+        &self,
+        req: &UpsertNasRequest,
+    ) -> Result<NasFleetClientSummary, NasFleetError> {
         if req.secret.len() < 12 {
             return Err(NasFleetError::SecretTooShort);
         }

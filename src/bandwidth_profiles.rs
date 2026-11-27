@@ -241,7 +241,8 @@ mod tests {
 
     #[test]
     fn fup_throttling_stages() {
-        let policy = BandwidthPolicy::new(10_000, 20_000).with_burst(20_000, 40_000, 8_000, 16_000, 10);
+        let policy =
+            BandwidthPolicy::new(10_000, 20_000).with_burst(20_000, 40_000, 8_000, 16_000, 10);
         let tier1 = policy.apply_fup(FupTier::Tier1Throttle);
         assert_eq!(tier1.base_rate.upload_kbps, 5_000);
         assert_eq!(tier1.base_rate.download_kbps, 10_000);
@@ -259,15 +260,20 @@ mod tests {
     #[test]
     fn validates_invalid_configurations() {
         let zero = BandwidthPolicy::new(0, 100);
-        assert_eq!(zero.build_mikrotik_rate_limit(), Err(BandwidthPolicyError::ZeroRate));
+        assert_eq!(
+            zero.build_mikrotik_rate_limit(),
+            Err(BandwidthPolicyError::ZeroRate)
+        );
 
-        let bad_burst = BandwidthPolicy::new(10_000, 20_000).with_burst(5_000, 10_000, 1_000, 2_000, 10);
+        let bad_burst =
+            BandwidthPolicy::new(10_000, 20_000).with_burst(5_000, 10_000, 1_000, 2_000, 10);
         assert_eq!(
             bad_burst.build_mikrotik_rate_limit(),
             Err(BandwidthPolicyError::BurstRateTooLow)
         );
 
-        let bad_time = BandwidthPolicy::new(10_000, 20_000).with_burst(20_000, 40_000, 8_000, 16_000, 0);
+        let bad_time =
+            BandwidthPolicy::new(10_000, 20_000).with_burst(20_000, 40_000, 8_000, 16_000, 0);
         assert_eq!(
             bad_time.build_mikrotik_rate_limit(),
             Err(BandwidthPolicyError::InvalidBurstTime)

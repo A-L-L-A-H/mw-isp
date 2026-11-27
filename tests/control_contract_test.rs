@@ -1,15 +1,15 @@
 //! Contract test for the versioned Go-to-Rust ISP runtime control contract.
 //!
-//! Every JSON fixture under apps/isp/tests/fixtures/ is self-describing: it
-//! carries the request envelope, the validation context it must be evaluated
-//! against, and the expected outcome/error code. The Rust test evaluates the
-//! fixtures with apps/isp/src/control_contract.rs; the Go test
-//! (apps/control-plane/isp) round-trips the same `request` envelope through
-//! matching Go structs. Both languages therefore read the exact same fixtures.
+//! Every JSON fixture under tests/fixtures/ is self-describing: it carries the
+//! request envelope, the validation context it must be evaluated against, and
+//! the expected outcome/error code. The Rust test evaluates the fixtures with
+//! src/control_contract.rs; the Go test (mw-cp/ispcontrol) round-trips the
+//! same `request` envelope through matching Go structs. Both languages
+//! therefore read the exact same fixtures.
 
 use moonwitness_isp::control_contract::{
-    validate_request, ControlRequest, ErrorCode, OperationOutcome, ValidationContext,
-    CONTRACT_SCHEMA_VERSION,
+    CONTRACT_SCHEMA_VERSION, ControlRequest, ErrorCode, OperationOutcome, ValidationContext,
+    validate_request,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -39,7 +39,6 @@ struct FixtureExpected {
 }
 
 fn fixtures_dir() -> PathBuf {
-    // CARGO_MANIFEST_DIR is apps/isp for the test target.
     let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     d.push("tests");
     d.push("fixtures");
@@ -93,6 +92,12 @@ fn positive_fixtures_are_accepted_as_planned() {
             ),
         };
         assert_eq!(res.outcome, OperationOutcome::Planned, "{}", name);
+        assert_eq!(
+            serde_json::to_value(res.outcome).unwrap(),
+            Value::String(f.expected.outcome.clone()),
+            "{}",
+            name
+        );
         assert_eq!(res.schema_version, CONTRACT_SCHEMA_VERSION, "{}", name);
         assert_eq!(res.correlation_id, f.request.correlation_id, "{}", name);
         assert_eq!(res.operation_id, f.request.operation_id, "{}", name);
@@ -116,6 +121,12 @@ fn negative_fixtures_are_rejected_with_typed_error_codes() {
         let res = validate_request(&f.request, &context_of(&f)).unwrap_err();
 
         assert_eq!(res.outcome, OperationOutcome::Rejected, "{}", name);
+        assert_eq!(
+            serde_json::to_value(res.outcome).unwrap(),
+            Value::String(f.expected.outcome.clone()),
+            "{}",
+            name
+        );
         assert_eq!(
             res.correlation_id, f.request.correlation_id,
             "{} must echo correlation_id",

@@ -244,6 +244,7 @@ impl Default for IsolirPolicy {
 }
 
 impl IsolirPolicy {
+    #[allow(dead_code)]
     pub fn new(captive_portal_url: impl Into<String>) -> Self {
         Self {
             captive_portal_url: captive_portal_url.into(),
@@ -331,6 +332,7 @@ pub struct AcsInformDevice {
 
 /// Errors returned when parsing a GenieACS Inform JSON payload.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum AcsInformError {
     #[error("invalid JSON payload: {0}")]
     InvalidJson(String),
@@ -343,9 +345,10 @@ pub enum AcsInformError {
 }
 
 /// Parse and normalize a TR-069 GenieACS Inform webhook JSON payload.
+#[allow(dead_code)]
 pub fn parse_acs_inform(payload: &str) -> Result<AcsInformDevice, AcsInformError> {
-    let root: Value =
-        serde_json::from_str(payload).map_err(|err| AcsInformError::InvalidJson(err.to_string()))?;
+    let root: Value = serde_json::from_str(payload)
+        .map_err(|err| AcsInformError::InvalidJson(err.to_string()))?;
     parse_acs_inform_value(&root)
 }
 
@@ -361,7 +364,12 @@ pub fn parse_acs_inform_value(root: &Value) -> Result<AcsInformDevice, AcsInform
         root,
         &[
             &["_deviceId", "_SerialNumber"],
-            &["InternetGatewayDevice", "DeviceInfo", "SerialNumber", "_value"],
+            &[
+                "InternetGatewayDevice",
+                "DeviceInfo",
+                "SerialNumber",
+                "_value",
+            ],
             &["InternetGatewayDevice", "DeviceInfo", "SerialNumber"],
             &["Device", "DeviceInfo", "SerialNumber", "_value"],
             &["Device", "DeviceInfo", "SerialNumber"],
@@ -374,7 +382,12 @@ pub fn parse_acs_inform_value(root: &Value) -> Result<AcsInformDevice, AcsInform
         root,
         &[
             &["_deviceId", "_OUI"],
-            &["InternetGatewayDevice", "DeviceInfo", "ManufacturerOUI", "_value"],
+            &[
+                "InternetGatewayDevice",
+                "DeviceInfo",
+                "ManufacturerOUI",
+                "_value",
+            ],
             &["InternetGatewayDevice", "DeviceInfo", "ManufacturerOUI"],
             &["Device", "DeviceInfo", "ManufacturerOUI", "_value"],
             &["Device", "DeviceInfo", "ManufacturerOUI"],
@@ -387,7 +400,12 @@ pub fn parse_acs_inform_value(root: &Value) -> Result<AcsInformDevice, AcsInform
         root,
         &[
             &["_deviceId", "_ProductClass"],
-            &["InternetGatewayDevice", "DeviceInfo", "ProductClass", "_value"],
+            &[
+                "InternetGatewayDevice",
+                "DeviceInfo",
+                "ProductClass",
+                "_value",
+            ],
             &["Device", "DeviceInfo", "ProductClass", "_value"],
             &["product_class"],
         ],
@@ -396,7 +414,12 @@ pub fn parse_acs_inform_value(root: &Value) -> Result<AcsInformDevice, AcsInform
     let firmware_version = extract_string(
         root,
         &[
-            &["InternetGatewayDevice", "DeviceInfo", "SoftwareVersion", "_value"],
+            &[
+                "InternetGatewayDevice",
+                "DeviceInfo",
+                "SoftwareVersion",
+                "_value",
+            ],
             &["InternetGatewayDevice", "DeviceInfo", "SoftwareVersion"],
             &["Device", "DeviceInfo", "SoftwareVersion", "_value"],
             &["Device", "DeviceInfo", "SoftwareVersion"],
@@ -523,12 +546,10 @@ fn lookup_path<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
 
 fn extract_string(root: &Value, paths: &[&[&str]]) -> Option<String> {
     for path in paths {
-        if let Some(val) = lookup_path(root, path) {
-            if let Some(s) = val.as_str() {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
+        if let Some(s) = lookup_path(root, path).and_then(Value::as_str) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
             }
         }
     }
@@ -542,7 +563,11 @@ fn extract_f64(root: &Value, paths: &[&[&str]]) -> Option<f64> {
                 return Some(n);
             }
             if let Some(s) = val.as_str() {
-                let cleaned = s.trim().trim_end_matches("dBm").trim_end_matches("dbm").trim();
+                let cleaned = s
+                    .trim()
+                    .trim_end_matches("dBm")
+                    .trim_end_matches("dbm")
+                    .trim();
                 if let Ok(parsed) = cleaned.parse::<f64>() {
                     return Some(parsed);
                 }
