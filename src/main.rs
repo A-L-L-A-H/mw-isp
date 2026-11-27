@@ -233,8 +233,9 @@ pub struct RecordAccountingParams<'a> {
 struct AppState {
     db: Database,
     admin_token: String,
-    vouchers: Arc<moonwitness_isp::vouchers::VoucherStore>,
-    audit: Arc<moonwitness_isp::session_audit::AuditLog>,
+    vouchers: moonwitness_isp::vouchers::VoucherStore,
+    audit: moonwitness_isp::session_audit::AuditLog,
+    nas_fleet: moonwitness_isp::nas_fleet::NasFleetStore,
 }
 
 #[derive(Clone)]
@@ -1174,14 +1175,19 @@ async fn run_acct_server(addr: SocketAddr, db: Database) -> Result<()> {
 
 fn build_http_router(db: Database, admin_token: String) -> Router {
     let state = AppState {
+        vouchers: moonwitness_isp::vouchers::VoucherStore::new(db.pool.clone()),
+        audit: moonwitness_isp::session_audit::AuditLog::new(db.pool.clone()),
+        nas_fleet: moonwitness_isp::nas_fleet::NasFleetStore::new(db.pool.clone()),
         db,
         admin_token,
-        vouchers: Arc::default(),
-        audit: Arc::default(),
     };
     let protected = Router::new()
         .route("/api/clients", get(list_clients).post(create_client))
         .route("/api/clients/{ip}/rotate-secret", post(rotate_secret))
+        .route("/api/isp/nas", get(isp_nas_list).post(isp_nas_create))
+        .route("/api/isp/nas/{ip}", axum::routing::delete(isp_nas_delete))
+        .route("/api/isp/nas/{ip}/rotate-secret", post(isp_nas_rotate_secret))
+        .route("/api/isp/nas/{ip}/health", post(isp_nas_update_health))
         .route(
             "/api/subscribers",
             get(list_subscribers).post(upsert_subscriber),
@@ -1301,12 +1307,13 @@ fn voucher_status(err: &moonwitness_isp::vouchers::VoucherError) -> StatusCode {
 async fn isp_voucher_batch(
     State(state): State<AppState>,
     Json(req): Json<moonwitness_isp::vouchers::BatchRequest>,
-) -> Result<Json<Vec<moonwitness_isp::vouchers::Voucher>>, (StatusCode, String)> {
+) -> Result<Json<Vec<moonwitness_isp::vouchers::Voucher>>, StatusCode> {
     state
         .vouchers
         .create_batch(&req)
+        .await
         .map(Json)
-        .map_err(|err| (voucher_status(&err), err.to_string()))
+        .map_err(|err| voucher_status(&err))
 }
 
 #[derive(serde::Deserialize)]
@@ -1318,18 +1325,24 @@ struct VoucherRedeemRequest {
 async fn isp_voucher_redeem(
     State(state): State<AppState>,
     Json(req): Json<VoucherRedeemRequest>,
-) -> Result<Json<moonwitness_isp::vouchers::Voucher>, (StatusCode, String)> {
+) -> Result<Json<moonwitness_isp::vouchers::Voucher>, StatusCode> {
     state
         .vouchers
         .redeem(&req.code, &req.username)
+        .await
         .map(Json)
-        .map_err(|err| (voucher_status(&err), err.to_string()))
+        .map_err(|err| voucher_status(&err))
 }
 
 async fn isp_voucher_list(
     State(state): State<AppState>,
-) -> Json<Vec<moonwitness_isp::vouchers::Voucher>> {
-    Json(state.vouchers.list())
+) -> Result<Json<Vec<moonwitness_isp::vouchers::Voucher>>, StatusCode> {
+    state
+        .vouchers
+        .list()
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn isp_sessions_live(
@@ -1370,6 +1383,7 @@ async fn isp_session_disconnect(
             session_row_id,
             username: row.username,
             nas_ip: resp.nas_ip.clone(),
+            action: "disconnect".to_string(),
             sent: resp.sent,
             ack: resp.ack,
             error: resp.error.clone(),
@@ -1378,12 +1392,13 @@ async fn isp_session_disconnect(
             session_row_id,
             username: row.username,
             nas_ip: row.nas_ip,
+            action: "disconnect".to_string(),
             sent: false,
             ack: false,
             error: Some(status.to_string()),
         },
     };
-    audit.record(entry);
+    let _ = audit.record(&entry).await;
     outcome
 }
 
@@ -1398,7 +1413,92 @@ async fn isp_metrics(
     let live: Vec<&RadiusSessionRow> = rows.iter().filter(|row| row.status == "active").collect();
     let input: i64 = live.iter().map(|row| row.acct_input_octets64).sum();
     let output: i64 = live.iter().map(|row| row.acct_output_octets64).sum();
-    Ok(Json(state.audit.metrics(live.len() as u64, input, output)))
+    state
+        .audit
+        .metrics(live.len() as u64, input, output)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn isp_nas_list(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<moonwitness_isp::nas_fleet::NasFleetClientSummary>>, StatusCode> {
+    state
+        .nas_fleet
+        .list_clients()
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn isp_nas_create(
+    State(state): State<AppState>,
+    Json(payload): Json<moonwitness_isp::nas_fleet::UpsertNasRequest>,
+) -> Result<Json<moonwitness_isp::nas_fleet::NasFleetClientSummary>, StatusCode> {
+    state
+        .nas_fleet
+        .upsert_client(&payload)
+        .await
+        .map(Json)
+        .map_err(|err| match err {
+            moonwitness_isp::nas_fleet::NasFleetError::SecretTooShort => StatusCode::BAD_REQUEST,
+            moonwitness_isp::nas_fleet::NasFleetError::InvalidIpAddress => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+}
+
+async fn isp_nas_delete(
+    State(state): State<AppState>,
+    Path(ip): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let deleted = state
+        .nas_fleet
+        .delete_client(&ip)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn isp_nas_rotate_secret(
+    State(state): State<AppState>,
+    Path(ip): Path<String>,
+    Json(payload): Json<moonwitness_isp::nas_fleet::RotateNasSecretRequest>,
+) -> Result<Json<moonwitness_isp::nas_fleet::NasFleetClientSummary>, StatusCode> {
+    state
+        .nas_fleet
+        .rotate_secret(
+            &ip,
+            &payload.secret,
+            payload.reason.as_deref().unwrap_or("api_rotation"),
+        )
+        .await
+        .map(Json)
+        .map_err(|err| match err {
+            moonwitness_isp::nas_fleet::NasFleetError::SecretTooShort => StatusCode::BAD_REQUEST,
+            moonwitness_isp::nas_fleet::NasFleetError::NotFound => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+}
+
+async fn isp_nas_update_health(
+    State(state): State<AppState>,
+    Path(ip): Path<String>,
+    Json(payload): Json<moonwitness_isp::nas_fleet::UpdateNasHealthRequest>,
+) -> Result<Json<moonwitness_isp::nas_fleet::NasFleetClientSummary>, StatusCode> {
+    state
+        .nas_fleet
+        .update_latency_health(&ip, payload.latency_ms)
+        .await
+        .map(Json)
+        .map_err(|err| match err {
+            moonwitness_isp::nas_fleet::NasFleetError::NotFound => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
 }
 
 async fn health() -> Json<serde_json::Value> {

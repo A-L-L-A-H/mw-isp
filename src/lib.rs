@@ -5,8 +5,10 @@
 //! structs and validation rules without touching the binary entry point
 //! (apps/isp/src/main.rs, which carries the only `mod control_contract;` edit).
 
+pub mod bandwidth_profiles;
 pub mod control_contract;
 pub mod fttx_suite;
 pub mod mikrotik_config;
+pub mod nas_fleet;
 pub mod session_audit;
 pub mod vouchers;
