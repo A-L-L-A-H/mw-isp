@@ -1,6 +1,5 @@
-# MoonWitness RADIUS Server Configuration
-# Copy to config.toml and adjust as needed
+# MoonWitness ISP & RADIUS Server Configuration (SQLite edge runtime)
+# Copy to config.toml and adjust as needed (or set MW_ISP_DB_PATH / MW_ISP_ADMIN_TOKEN env vars)
 
-database_url = "postgresql://postgres:postgres@127.0.0.1:5432/moonwitness_radius"
-radius_secret = "testing123"
+db_path = "isp.db"
 admin_token = "moonwitness-radius-admin"

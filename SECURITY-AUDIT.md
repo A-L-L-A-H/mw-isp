@@ -1,6 +1,6 @@
 # M19.04 — ISP Rust dependency advisory triage
 
-Audit base: `apps/isp/Cargo.lock` at 292 crates, 1568 advisories, 2026-11-26.
+Audit base: `Cargo.lock` at 282 crates, 1568 advisories, 2026-11-26.
 Owner of this triage: MoonWitness Dev (ISP platform). Review date: 2026-11-26.
 Expiry for both exceptions: **2026-12-31**, or immediately when a patched
 `sqlx-sqlite` 0.8.x release becomes available — whichever comes first.
@@ -11,7 +11,7 @@ Expiry for both exceptions: **2026-12-31**, or immediately when a patched
 | RUSTSEC-2023-0071 (Marvin timing attack, CVSS 3.1 base 5.9) | rsa 0.9.10 | No — only `sqlx-mysql`, which is not enabled by this crate's feature set (`cargo tree -i rsa` and `--target all` both report no reverse dependencies). | Time-bound exception: not in any compiled target; remove when sqlx drops the stale optional lock entry. |
 
 The unmaintained-chrono warning (RUSTSEC-2026-0543) was resolved by removing
-the unused `chrono` feature from the sqlx dependency in `apps/isp/Cargo.toml`;
+the unused `chrono` feature from the sqlx dependency in `Cargo.toml`;
 `cargo tree -i chrono` now reports no package and `cargo audit` no longer emits
 the warning.
 
@@ -29,9 +29,8 @@ the warning.
 ## Reproduction
 
 ```bash
-cd apps/isp
 cargo audit --ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2023-0071
-cargo test --quiet        # 22 passed, 0 failed
+cargo test --quiet
 ```
 
 No HIGH/CRITICAL advisory is untriaged. Both remaining findings are medium,

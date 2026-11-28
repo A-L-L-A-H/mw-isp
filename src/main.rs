@@ -68,7 +68,8 @@ async fn main() -> Result<()> {
 
     let radius_addr: SocketAddr = cli.radius_addr.parse()?;
     let acct_addr: SocketAddr = cli.acct_addr.parse()?;
-    let http_addr: SocketAddr = cli.http_addr.parse()?;
+    let resolved_http_addr = resolve_http_addr(&cli.http_addr);
+    let http_addr: SocketAddr = resolved_http_addr.parse()?;
 
     let radius_db = db.clone();
     let radius_handle =
@@ -85,7 +86,7 @@ async fn main() -> Result<()> {
 
     info!(
         "MoonWitness ISP server started (auth={}, acct={}, http={})",
-        cli.radius_addr, cli.acct_addr, cli.http_addr
+        cli.radius_addr, cli.acct_addr, resolved_http_addr
     );
 
     signal::ctrl_c().await?;
@@ -95,6 +96,26 @@ async fn main() -> Result<()> {
     acct_handle.abort();
     http_handle.abort();
     Ok(())
+}
+
+fn resolve_http_addr(cli_http_addr: &str) -> String {
+    if cli_http_addr != "127.0.0.1:3000" {
+        return cli_http_addr.to_string();
+    }
+    if let Ok(addr) = std::env::var("MW_ISP_HTTP_ADDR") {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    for key in ["MW_ISP_PORT", "PORT"] {
+        if let Ok(port_str) = std::env::var(key)
+            && let Ok(port) = port_str.trim().parse::<u16>()
+        {
+            return format!("0.0.0.0:{port}");
+        }
+    }
+    cli_http_addr.to_string()
 }
 
 fn load_config(cli_db_path: &str) -> Result<Config> {
@@ -234,8 +255,12 @@ struct AppState {
     db: Database,
     admin_token: String,
     vouchers: moonwitness_isp::vouchers::VoucherStore,
+    voucher_checkout: moonwitness_isp::voucher_checkout::VoucherCheckoutStore,
+    outage_notifier: moonwitness_isp::outage_notifier::OutageNotifier,
     audit: moonwitness_isp::session_audit::AuditLog,
     nas_fleet: moonwitness_isp::nas_fleet::NasFleetStore,
+    control_generation: Arc<AtomicU64>,
+    applied_operations: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -430,10 +455,7 @@ impl Database {
         Ok(())
     }
 
-    async fn record_accounting(
-        &self,
-        params: RecordAccountingParams<'_>,
-    ) -> Result<()> {
+    async fn record_accounting(&self, params: RecordAccountingParams<'_>) -> Result<()> {
         let RecordAccountingParams {
             session_id,
             username,
@@ -1015,10 +1037,35 @@ async fn process_access_request(db: &Database, raw: &[u8], src_ip: &str) -> Opti
         RadiusAttribute::string(attr_type::FILTER_ID, &filter_id),
         rate_limit,
     ];
-    if let Some(ip_str) = subscriber.framed_ip.as_deref()
-        && let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-            reply_attrs.push(RadiusAttribute::ipv4(attr_type::FRAMED_IP_ADDRESS, ip));
+    if subscriber.connection_type == "hotspot"
+        && let Ok(Some(time_limit_secs)) =
+            sqlx::query_scalar::<_, i64>("SELECT time_limit_secs FROM isp_vouchers WHERE code = ?1")
+                .bind(&username)
+                .fetch_optional(&db.pool)
+                .await
+    {
+        if time_limit_secs > 0 {
+            reply_attrs.push(RadiusAttribute::u32(
+                attr_type::SESSION_TIMEOUT,
+                time_limit_secs.min(u32::MAX as i64) as u32,
+            ));
         }
+        let _ = sqlx::query(
+            "UPDATE isp_vouchers
+             SET redeemed = 1,
+                 redeemed_by = COALESCE(redeemed_by, ?1),
+                 redeemed_at = COALESCE(redeemed_at, datetime('now'))
+             WHERE code = ?1",
+        )
+        .bind(&username)
+        .execute(&db.pool)
+        .await;
+    }
+    if let Some(ip_str) = subscriber.framed_ip.as_deref()
+        && let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+    {
+        reply_attrs.push(RadiusAttribute::ipv4(attr_type::FRAMED_IP_ADDRESS, ip));
+    }
 
     let _ = db
         .log_auth(Some(nas.id), &username, true, src_ip, "Access-Accept")
@@ -1176,8 +1223,14 @@ async fn run_acct_server(addr: SocketAddr, db: Database) -> Result<()> {
 fn build_http_router(db: Database, admin_token: String) -> Router {
     let state = AppState {
         vouchers: moonwitness_isp::vouchers::VoucherStore::new(db.pool.clone()),
+        voucher_checkout: moonwitness_isp::voucher_checkout::VoucherCheckoutStore::new(
+            db.pool.clone(),
+        ),
+        outage_notifier: moonwitness_isp::outage_notifier::OutageNotifier::new(db.pool.clone()),
         audit: moonwitness_isp::session_audit::AuditLog::new(db.pool.clone()),
         nas_fleet: moonwitness_isp::nas_fleet::NasFleetStore::new(db.pool.clone()),
+        control_generation: Arc::new(AtomicU64::new(1)),
+        applied_operations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         db,
         admin_token,
     };
@@ -1186,7 +1239,10 @@ fn build_http_router(db: Database, admin_token: String) -> Router {
         .route("/api/clients/{ip}/rotate-secret", post(rotate_secret))
         .route("/api/isp/nas", get(isp_nas_list).post(isp_nas_create))
         .route("/api/isp/nas/{ip}", axum::routing::delete(isp_nas_delete))
-        .route("/api/isp/nas/{ip}/rotate-secret", post(isp_nas_rotate_secret))
+        .route(
+            "/api/isp/nas/{ip}/rotate-secret",
+            post(isp_nas_rotate_secret),
+        )
         .route("/api/isp/nas/{ip}/health", post(isp_nas_update_health))
         .route(
             "/api/subscribers",
@@ -1199,16 +1255,36 @@ fn build_http_router(db: Database, admin_token: String) -> Router {
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/disconnect", post(disconnect_session))
         .route("/api/stats", get(get_stats))
-        .route("/api/fttx/trustpositif/check", post(fttx_trustpositif_check))
+        .route(
+            "/api/fttx/trustpositif/check",
+            post(fttx_trustpositif_check),
+        )
         .route("/api/fttx/isolir/evaluate", post(fttx_isolir_evaluate))
         .route("/api/fttx/acs/inform", post(fttx_acs_inform))
         .route("/metrics", get(get_metrics))
+        .route("/api/isp/control", post(isp_control_dispatch))
         .route("/api/isp/mikrotik/generate-rsc", post(isp_generate_rsc))
         .route("/api/isp/vouchers/batch", post(isp_voucher_batch))
+        .route("/api/isp/vouchers/checkout", post(isp_voucher_checkout))
+        .route(
+            "/api/isp/vouchers/qris/settle",
+            post(isp_voucher_qris_settle),
+        )
+        .route(
+            "/api/isp/vouchers/{order_id}/receipt",
+            get(isp_voucher_receipt),
+        )
+        .route("/api/isp/vouchers/prune", post(isp_voucher_prune))
         .route("/api/isp/vouchers/redeem", post(isp_voucher_redeem))
         .route("/api/isp/vouchers", get(isp_voucher_list))
+        .route("/api/isp/outages/detect", post(isp_outages_detect))
+        .route("/api/isp/outages/observe", post(isp_outages_observe))
+        .route("/api/isp/outages/events", get(isp_outages_events))
         .route("/api/isp/sessions/live", get(isp_sessions_live))
-        .route("/api/isp/sessions/{id}/disconnect", post(isp_session_disconnect))
+        .route(
+            "/api/isp/sessions/{id}/disconnect",
+            post(isp_session_disconnect),
+        )
         .route("/api/isp/metrics", get(isp_metrics))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1216,6 +1292,10 @@ fn build_http_router(db: Database, admin_token: String) -> Router {
         ));
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/api/isp/vouchers/qris/webhook",
+            post(isp_voucher_qris_webhook),
+        )
         .merge(protected)
         .with_state(state)
 }
@@ -1298,8 +1378,10 @@ async fn isp_generate_rsc(
 fn voucher_status(err: &moonwitness_isp::vouchers::VoucherError) -> StatusCode {
     use moonwitness_isp::vouchers::VoucherError as E;
     match err {
-        E::NotFound => StatusCode::NOT_FOUND,
-        E::AlreadyRedeemed => StatusCode::CONFLICT,
+        E::NotFound | E::OrderNotFound => StatusCode::NOT_FOUND,
+        E::AlreadyRedeemed | E::OrderNotPending(_) => StatusCode::CONFLICT,
+        E::InvalidSignature => StatusCode::UNAUTHORIZED,
+        E::AmountMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -1314,6 +1396,269 @@ async fn isp_voucher_batch(
         .await
         .map(Json)
         .map_err(|err| voucher_status(&err))
+}
+
+async fn isp_voucher_checkout(
+    State(state): State<AppState>,
+    Json(req): Json<moonwitness_isp::vouchers::HotspotCheckoutRequest>,
+) -> Result<(StatusCode, Json<moonwitness_isp::vouchers::HotspotOrder>), StatusCode> {
+    state
+        .vouchers
+        .checkout(&req)
+        .await
+        .map(|order| (StatusCode::CREATED, Json(order)))
+        .map_err(|err| voucher_status(&err))
+}
+
+async fn isp_voucher_qris_settle(
+    State(state): State<AppState>,
+    Json(payload): Json<moonwitness_isp::vouchers::QrisSettlementPayload>,
+) -> Result<Json<moonwitness_isp::vouchers::QrisSettlementResult>, StatusCode> {
+    state
+        .vouchers
+        .settle_qris(&payload)
+        .await
+        .map(Json)
+        .map_err(|err| voucher_status(&err))
+}
+
+async fn isp_voucher_qris_webhook(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<moonwitness_isp::vouchers::QrisSettlementResult>, StatusCode> {
+    let sig = headers
+        .get("x-qris-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let webhook_secret = std::env::var("MW_ISP_QRIS_WEBHOOK_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.admin_token.clone());
+
+    if !moonwitness_isp::vouchers::verify_qris_signature(&webhook_secret, &body, sig) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let payload: moonwitness_isp::vouchers::QrisSettlementPayload =
+        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    state
+        .vouchers
+        .settle_qris(&payload)
+        .await
+        .map(Json)
+        .map_err(|err| voucher_status(&err))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OutageDetectRequest {
+    #[serde(default)]
+    observations: Vec<moonwitness_isp::outage_detector::NasLinkObservation>,
+    #[serde(default)]
+    recipients: Vec<moonwitness_isp::outage_detector::NoticeRecipient>,
+    #[serde(default)]
+    policy: Option<moonwitness_isp::outage_detector::OutageDetectorPolicy>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OutageDetectResponse {
+    outages: Vec<moonwitness_isp::outage_detector::DetectedOutage>,
+    whatsapp_notices: Vec<moonwitness_isp::outage_detector::WhatsAppNoticePayload>,
+}
+
+async fn isp_outages_detect(
+    State(state): State<AppState>,
+    Json(req): Json<OutageDetectRequest>,
+) -> Result<Json<OutageDetectResponse>, StatusCode> {
+    let policy = req.policy.unwrap_or_default();
+    let outages = if req.observations.is_empty() {
+        moonwitness_isp::outage_detector::detect_fleet_outages_from_db(&state.db.pool, &policy)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        req.observations
+            .iter()
+            .filter_map(|obs| {
+                moonwitness_isp::outage_detector::evaluate_nas_observation(obs, &policy)
+            })
+            .collect()
+    };
+
+    let mut whatsapp_notices = Vec::new();
+    for outage in &outages {
+        whatsapp_notices.extend(moonwitness_isp::outage_detector::build_whatsapp_notices(
+            outage,
+            &req.recipients,
+        ));
+    }
+
+    Ok(Json(OutageDetectResponse {
+        outages,
+        whatsapp_notices,
+    }))
+}
+
+async fn isp_outages_observe(
+    State(state): State<AppState>,
+    Json(req): Json<moonwitness_isp::outage_notifier::LinkObservationRequest>,
+) -> Result<Json<moonwitness_isp::outage_notifier::LinkObservationResult>, StatusCode> {
+    state
+        .outage_notifier
+        .observe_link(&req)
+        .await
+        .map(Json)
+        .map_err(|err| match err {
+            moonwitness_isp::outage_notifier::OutageNotifierError::InvalidNasIp => {
+                StatusCode::BAD_REQUEST
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+}
+
+async fn isp_outages_events(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<moonwitness_isp::outage_notifier::OutageEventRecord>>, StatusCode> {
+    state
+        .outage_notifier
+        .list_events(None)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn isp_voucher_prune(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let pruned = state
+        .vouchers
+        .prune_expired()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({
+        "action": "prune_expired_vouchers",
+        "pruned": pruned,
+    })))
+}
+
+#[allow(clippy::type_complexity)]
+async fn isp_voucher_receipt(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> Result<Json<moonwitness_isp::voucher_checkout::VoucherOrderReceipt>, StatusCode> {
+    if let Ok(receipt) = state.voucher_checkout.get_receipt(&order_id, None).await {
+        return Ok(Json(receipt));
+    }
+
+    let order_row: Option<(
+        String,
+        String,
+        i64,
+        i64,
+        Option<i64>,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT order_id, package_code, amount_idr, time_limit_secs, quota_bytes,
+                mikrotik_rate_limit, qris_reference, qris_payload, status, settled_at
+         FROM hotspot_voucher_orders
+         WHERE order_id = ?1",
+    )
+    .bind(order_id.trim())
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let Some((
+        oid,
+        package_name,
+        amount_idr,
+        time_limit_secs,
+        quota_bytes,
+        rate_limit,
+        qris_ref,
+        qris_payload,
+        status,
+        settled_at,
+    )) = order_row
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let codes: Vec<(String,)> =
+        sqlx::query_as("SELECT code FROM isp_vouchers WHERE order_id = ?1 ORDER BY code ASC")
+            .bind(&oid)
+            .fetch_all(&state.db.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let base = "http://hotspot.mw-isp.id/login";
+    let vouchers = codes
+        .into_iter()
+        .map(|(code,)| {
+            let login_url = format!("{base}?username={code}&password={code}");
+            let qr_login_data =
+                format!("WIFI:S:MoonWitness-Hotspot;T:nopass;H:false;;LOGIN:{login_url}");
+            moonwitness_isp::voucher_checkout::VoucherCredentialReceiptItem {
+                code: code.clone(),
+                username: code.clone(),
+                password: code,
+                mikrotik_login_url: login_url,
+                qr_login_data,
+                time_limit_secs: time_limit_secs as u64,
+                quota_bytes: quota_bytes.map(|q| q as u64),
+                mikrotik_rate_limit: rate_limit.clone(),
+            }
+        })
+        .collect();
+
+    Ok(Json(
+        moonwitness_isp::voucher_checkout::VoucherOrderReceipt {
+            order_id: oid,
+            package_name,
+            status,
+            amount_idr: amount_idr.max(0) as u64,
+            qris_payload,
+            payment_reference: Some(qris_ref),
+            settled_at,
+            vouchers,
+        },
+    ))
+}
+
+async fn isp_control_dispatch(
+    State(state): State<AppState>,
+    Json(mut req): Json<control_contract::ControlRequest>,
+) -> (StatusCode, Json<control_contract::ControlResponse>) {
+    if req.auth_token.is_none() {
+        req.auth_token = Some(state.admin_token.clone());
+    }
+    let current_gen = state.control_generation.load(Ordering::Relaxed);
+    let mut applied = state.applied_operations.lock().await;
+    let ctx = control_contract::ValidationContext {
+        current_generation: current_gen,
+        expected_auth_token: Some(&state.admin_token),
+        applied_operations: &applied,
+        deadline_expired: false,
+    };
+    match control_contract::validate_request(&req, &ctx) {
+        Ok(mut resp) => {
+            applied.push(req.operation_id.clone());
+            applied.push(req.idempotency_key.clone());
+            if req.operation_type == control_contract::OperationType::ConfigPush {
+                state
+                    .control_generation
+                    .store(req.config_generation, Ordering::Relaxed);
+                resp.outcome = control_contract::OperationOutcome::Applied;
+            }
+            (StatusCode::OK, Json(resp))
+        }
+        Err(rej) => (StatusCode::UNPROCESSABLE_ENTITY, Json(rej)),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1353,7 +1698,11 @@ async fn isp_sessions_live(
         .list_sessions()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(rows.into_iter().filter(|row| row.status == "active").collect()))
+    Ok(Json(
+        rows.into_iter()
+            .filter(|row| row.status == "active")
+            .collect(),
+    ))
 }
 
 async fn isp_session_disconnect(
@@ -1685,12 +2034,12 @@ async fn disconnect_session(
                 && let Err(err) = db
                     .mark_sessions_terminated(&payload.username, session_id.as_deref())
                     .await
-                {
-                    warn!(
-                        "Disconnect acknowledged but failed to mark sessions terminated for {}: {}",
-                        payload.username, err
-                    );
-                }
+            {
+                warn!(
+                    "Disconnect acknowledged but failed to mark sessions terminated for {}: {}",
+                    payload.username, err
+                );
+            }
             Ok(Json(DisconnectResponse {
                 sent: true,
                 ack,
@@ -1733,9 +2082,10 @@ async fn send_disconnect_request(
         ));
     }
     if let Some(framed_ip) = payload.framed_ip.as_deref()
-        && let Ok(ip) = framed_ip.parse::<Ipv4Addr>() {
-            attributes.push(RadiusAttribute::ipv4(attr_type::FRAMED_IP_ADDRESS, ip));
-        }
+        && let Ok(ip) = framed_ip.parse::<Ipv4Addr>()
+    {
+        attributes.push(RadiusAttribute::ipv4(attr_type::FRAMED_IP_ADDRESS, ip));
+    }
 
     let packet = encode_disconnect_request(1, &attributes, secret.as_bytes());
     socket.send(&packet).await?;
@@ -1980,6 +2330,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_accounting_request(
         id: u8,
         username: &str,
@@ -3127,5 +3478,199 @@ mod tests {
             .expect("new session row exists");
         assert_eq!(fresh.acct_input_octets64, 100);
         assert_eq!(fresh.acct_output_octets64, 200);
+    }
+
+    #[tokio::test]
+    async fn v20_prepaid_hotspot_checkout_qris_webhook_activates_radius_batch() {
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+
+        let (_dir, db) = test_db().await;
+        db.upsert_client("Hotspot NAS", "127.0.0.1", "hotspot-secret-123")
+            .await
+            .unwrap();
+        let token = "test-admin-token-v20-qris-000000000000000000000000000000000000";
+        let app = build_http_router(db.clone(), token.to_string());
+
+        // 1. POST /api/isp/vouchers/checkout creates durable pending order
+        let checkout_body = serde_json::json!({
+            "order_id": "ORD-V20-E2E",
+            "customer_phone": "081299998888",
+            "package_code": "HOTSPOT-1D-10M",
+            "count": 3,
+            "amount_idr": 15000,
+            "time_limit_secs": 86400,
+            "quota_bytes": 2_000_000_000u64,
+            "rate_limit": "5M/10M"
+        });
+        let checkout_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/isp/vouchers/checkout")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(checkout_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(checkout_res.status(), StatusCode::CREATED);
+
+        // 2. Signed QRIS webhook callback settles order & activates batch in RADIUS
+        let webhook_payload = br#"{"qris_reference":"QRIS-ORD-V20-E2E","paid_amount_idr":15000,"settlement_status":"PAID"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).unwrap();
+        mac.update(webhook_payload);
+        let sig = hex::encode(mac.finalize().into_bytes());
+
+        // Invalid signature rejected with 401
+        let bad_sig_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/isp/vouchers/qris/webhook")
+                    .header("x-qris-signature", "deadbeef")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(webhook_payload.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_sig_res.status(), StatusCode::UNAUTHORIZED);
+
+        // Valid signature settles order and mints 3 active vouchers
+        let settle_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/isp/vouchers/qris/webhook")
+                    .header("x-qris-signature", format!("sha256={sig}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(webhook_payload.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settle_res.status(), StatusCode::OK);
+        let settle_bytes = axum::body::to_bytes(settle_res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let settled: moonwitness_isp::vouchers::QrisSettlementResult =
+            serde_json::from_slice(&settle_bytes).unwrap();
+        assert_eq!(settled.order.status, "settled");
+        assert_eq!(settled.vouchers.len(), 3);
+        assert_eq!(settled.radius_activated_count, 3);
+
+        // 3. Instant RADIUS authentication succeeds for minted voucher code with Session-Timeout & MikroTik-Rate-Limit
+        let voucher_code = &settled.vouchers[0].code;
+        let access_req =
+            build_pap_access_request(88, voucher_code, voucher_code, b"hotspot-secret-123");
+        let raw_reply = process_access_request(&db, &access_req, "127.0.0.1")
+            .await
+            .expect("expected RADIUS Access-Accept for settled voucher");
+        let reply = decode_packet(&raw_reply).unwrap();
+        assert_eq!(reply.code, codes::ACCESS_ACCEPT);
+        assert_eq!(
+            reply
+                .attribute(attr_type::FILTER_ID)
+                .map(RadiusAttribute::as_str)
+                .as_deref(),
+            Some("policy-hotspot")
+        );
+        assert_eq!(
+            reply
+                .attribute(attr_type::SESSION_TIMEOUT)
+                .and_then(RadiusAttribute::as_u32),
+            Some(86400)
+        );
+        let vsa = reply
+            .attribute(attr_type::VENDOR_SPECIFIC)
+            .expect("expected MikroTik-Rate-Limit VSA");
+        let rate_str = std::str::from_utf8(
+            decode_vsa_value(vsa, mikrotik::VENDOR_ID, mikrotik::RATE_LIMIT_ATTR).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rate_str, "5000k/10000k");
+
+        // Durable voucher state records redemption after RADIUS login
+        let redeemed_flag: i64 =
+            sqlx::query_scalar("SELECT redeemed FROM isp_vouchers WHERE code = ?1")
+                .bind(voucher_code)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(redeemed_flag, 1);
+    }
+
+    #[tokio::test]
+    async fn v50_mikrotik_pppoe_nas_outage_detector_endpoint_emits_localized_whatsapp_notices() {
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+
+        let (_dir, db) = test_db().await;
+        let token = "test-admin-token-v50-outages-00000000000000000000000000000000000";
+        let app = build_http_router(db, token.to_string());
+
+        let detect_body = serde_json::json!({
+            "observations": [
+                {
+                    "nas_name": "CCR2116-Bekasi-Core",
+                    "nas_ip": "10.99.0.1",
+                    "tower_id": "TWR-BKS-01",
+                    "link_up": false,
+                    "latency_ms": null,
+                    "heartbeat_age_secs": 240,
+                    "active_pppoe_sessions": 0,
+                    "dropped_pppoe_sessions": 64,
+                    "detected_at": "2026-11-27T10:00:00Z"
+                }
+            ],
+            "recipients": [
+                { "phone": "081211112222", "locale": "id" },
+                { "phone": "+6281333334444", "locale": "en" }
+            ]
+        });
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/isp/outages/detect")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(detect_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["outages"].as_array().unwrap().len(), 1);
+        let notices = parsed["whatsapp_notices"].as_array().unwrap();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0]["recipient"], "6281211112222");
+        assert_eq!(notices[0]["locale"], "id");
+        assert!(
+            notices[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("[GANGGUAN JARINGAN - KRITIS]")
+        );
+        assert_eq!(notices[1]["recipient"], "6281333334444");
+        assert_eq!(notices[1]["locale"], "en");
+        assert!(
+            notices[1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("[NETWORK OUTAGE - CRITICAL]")
+        );
     }
 }

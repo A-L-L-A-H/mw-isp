@@ -28,6 +28,7 @@ pub mod attr_type {
     pub const FILTER_ID: u8 = 11;
     pub const REPLY_MESSAGE: u8 = 18;
     pub const VENDOR_SPECIFIC: u8 = 26;
+    pub const SESSION_TIMEOUT: u8 = 27;
     pub const CALLED_STATION_ID: u8 = 30;
     pub const CALLING_STATION_ID: u8 = 31;
     pub const ACCT_STATUS_TYPE: u8 = 40;
@@ -92,11 +93,7 @@ pub fn encode_vsa(vendor_id: u32, vendor_type: u8, value: &[u8]) -> RadiusAttrib
 
 /// Decodes a VSA value, rejecting malformed vendor-length fields.
 #[allow(dead_code)]
-pub fn decode_vsa_value(
-    attr: &RadiusAttribute,
-    vendor_id: u32,
-    vendor_type: u8,
-) -> Option<&[u8]> {
+pub fn decode_vsa_value(attr: &RadiusAttribute, vendor_id: u32, vendor_type: u8) -> Option<&[u8]> {
     if attr.attr_type != attr_type::VENDOR_SPECIFIC || attr.value.len() < 6 {
         return None;
     }
@@ -626,7 +623,7 @@ mod tests {
             .unwrap_err(),
             AttributeValidationError::InvalidValue
         );
-        assert!(mikrotik::MAX_FORMAT_LEN <= mikrotik::MAX_VALUE_LEN);
+        const _: () = assert!(mikrotik::MAX_FORMAT_LEN <= mikrotik::MAX_VALUE_LEN);
     }
 
     #[test]
@@ -761,7 +758,7 @@ mod tests {
             buf[2..4].copy_from_slice(&total.to_be_bytes());
             let mut hasher = Md5::new();
             hasher.update(&buf[0..4]);
-            hasher.update(&req_auth);
+            hasher.update(req_auth);
             hasher.update(&buf[20..]);
             hasher.update(secret);
             let digest: [u8; 16] = hasher.finalize().into();
